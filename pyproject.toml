@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "advance-image-viewer"
-version = "0.2.1"
+version = "0.2.2"
 authors = [
   { name="Akshat Kotpalliwar", email="akshatkot@gmail.com" }
 ]
@@ -17,6 +17,8 @@ dependencies = [
     "pyinstaller>=6.16.0",
     "requests>=2.32.5",
     "google-genai>=0.2.0",
+    "imageio>=2.31.0",
+    "imageio-ffmpeg>=0.4.9",
 ]
 license = { text = "GPL-3.0-only" }
 classifiers = [

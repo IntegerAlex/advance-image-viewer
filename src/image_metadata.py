@@ -12,6 +12,13 @@ from typing import Dict, Any, Optional
 
 from PIL import ExifTags
 
+try:
+    from src.video_utils import is_video_file, get_video_metadata
+except ImportError:
+    # Video support not available
+    is_video_file = None
+    get_video_metadata = None
+
 logger = logging.getLogger(__name__)
 
 EXIF_TAGS = {tag_id: name for tag_id, name in ExifTags.TAGS.items()}
@@ -19,11 +26,25 @@ EXIF_TAGS = {tag_id: name for tag_id, name in ExifTags.TAGS.items()}
 
 def build_metadata_text(image_path: str, image) -> str:
     """
-    Construct a detailed metadata string for the image, including file system
-    details and any EXIF information the image exposes.
+    Construct a detailed metadata string for the image or video, including file system
+    details and any EXIF information the image exposes, or video metadata.
     """
     logger.debug("Building metadata text for image: %s", image_path)
+    
+    # Check if it's a video file
+    is_video = False
+    video_meta = {}
+    if is_video_file is not None and is_video_file(image_path):
+        try:
+            is_video = True
+            video_meta = get_video_metadata(image_path)
+            logger.debug("Detected video file, metadata: %s", video_meta)
+        except Exception as e:
+            logger.debug("Failed to get video metadata: %s", e)
+            is_video = False
+
     details = _collect_metadata(image_path, image)
+    
     sections = [
         "FILE INFO",
         f" • File: {details['filename']}",
@@ -33,18 +54,34 @@ def build_metadata_text(image_path: str, image) -> str:
         f" • Created: {details['created']}",
         f" • Modified: {details['modified']}",
         "",
-        "IMAGE INFO",
-        f" • Format: {details['format']} ({details['mode']})",
-        f" • Dimensions: {details['width']}×{details['height']} px",
-        f" • DPI: {details['dpi']}",
     ]
 
-    exif_lines = _format_exif(details["exif"])
-    if exif_lines:
-        sections.extend(["", "EXIF", *exif_lines])
-        logger.debug("Found %d EXIF tags", len(exif_lines))
+    if is_video and video_meta:
+        # Video metadata section
+        sections.extend([
+            "VIDEO INFO",
+            f" • Format: Video ({details['mode']})",
+            f" • Dimensions: {details['width']}×{details['height']} px",
+            f" • Total Frames: {video_meta.get('total_frames', 0)}",
+            f" • FPS: {video_meta.get('fps', 0.0):.2f}",
+            f" • Duration: {video_meta.get('duration_formatted', 'Unknown')}",
+            f" • Codec: {video_meta.get('codec', 'Unknown')}",
+        ])
     else:
-        logger.debug("No EXIF data found in image")
+        # Image metadata section
+        sections.extend([
+            "IMAGE INFO",
+            f" • Format: {details['format']} ({details['mode']})",
+            f" • Dimensions: {details['width']}×{details['height']} px",
+            f" • DPI: {details['dpi']}",
+        ])
+
+        exif_lines = _format_exif(details["exif"])
+        if exif_lines:
+            sections.extend(["", "EXIF", *exif_lines])
+            logger.debug("Found %d EXIF tags", len(exif_lines))
+        else:
+            logger.debug("No EXIF data found in image")
 
     result = "\n".join(sections)
     logger.debug("Metadata text built: %d lines, %d bytes", len(sections), len(result))

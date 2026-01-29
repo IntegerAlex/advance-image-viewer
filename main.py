@@ -8,10 +8,26 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog
 
-from PIL import Image, ImageTk
+try:
+    from PIL import Image, ImageTk
+except ImportError as e:
+    if "ImageTk" in str(e):
+        print(
+            "Error: Pillow was installed without tkinter support.\n"
+            "Please reinstall Pillow in your virtual environment:\n"
+            "  uv pip install --force-reinstall pillow\n"
+            "Or if using system Python:\n"
+            "  pip install --force-reinstall pillow\n"
+            "\n"
+            "Make sure python3-tk is installed:\n"
+            "  sudo apt-get install python3-tk  # Debian/Ubuntu\n"
+            "  sudo dnf install python3-tkinter  # Fedora/RHEL\n"
+        )
+    raise
 
 from src.calculate_max_zoom import calculate_max_zoom as calc_max_zoom
 from src.display_image import display_image as display_image_fn
@@ -26,6 +42,12 @@ from src.services.gemini_image_service import (
     generate_image_edit,
 )
 from src.update_cursor_info import update_cursor_info as update_cursor_info_fn
+from src.video_utils import (
+    is_video_file,
+    extract_frame_from_video,
+    get_video_metadata,
+    extract_multiple_frames,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +67,22 @@ class SimpleImageViewer:
         self.original_image = None
         self.original_size = None
         self.image_path = None
+
+        # Initialize video-related attributes
+        self.is_video = False
+        self.video_metadata = {}
+        self.current_frame = 0
+        self.video_controls_frame = None
+        self.frame_slider = None
+        self.frame_entry = None
+        self.thumbnails_canvas = None
+        self.thumbnails_container = None
+
+        # Initialize frame caching attributes
+        self.frame_cache = {}  # Dict[int, Image.Image] - Cache for recently viewed frames
+        self.max_cache_size = 10  # Maximum frames to cache
+        self.slider_update_pending = False  # Flag for throttled updates
+        self.last_slider_update = 0.0  # Timestamp for throttling
 
         # Define zoom constraints - will be updated when image is loaded
         self.min_zoom = 1.0
@@ -206,18 +244,18 @@ class SimpleImageViewer:
         worker.start()
 
     def show_image_selection_dialog(self):
-        """Show dialog to select an image file from system."""
+        """Show dialog to select an image or video file from system."""
         file_path = filedialog.askopenfilename(
-            title="Select Image File",
+            title="Select Image or Video File",
             filetypes=[
-                ("Image files", "*.png *.jpg *.jpeg *.gif *.bmp *.tiff *.tif"),
+                ("Image files", "*.png *.jpg *.jpeg *.gif *.bmp *.tiff *.tif *.webp"),
+                ("WebP files", "*.webp"),
                 ("PNG files", "*.png"),
-                ("JPEG files", "*.jpg"),
-                ("JPEG files", "*.jpeg"),
+                ("JPEG files", "*.jpg *.jpeg"),
                 ("GIF files", "*.gif"),
                 ("BMP files", "*.bmp"),
-                ("TIFF files", "*.tiff"),
-                ("TIFF files", "*.tif"),
+                ("TIFF files", "*.tiff *.tif"),
+                ("Video files", "*.webm *.mp4 *.avi *.mov *.mkv"),
                 ("All files", "*.*"),
             ],
         )
@@ -265,12 +303,49 @@ class SimpleImageViewer:
             self._log_debug("Open dialog failed: %s", exc)
 
     def load_image(self, image_path):
-        """Load an image and initialize viewer state."""
+        """Load an image or extract frame from video."""
         try:
-            self.original_image = Image.open(image_path)
-            self.original_size = self.original_image.size
             self.image_path = os.path.abspath(image_path)
-            self._log_debug("Loaded image %s (%s)", image_path, self.original_size)
+            self.is_video = is_video_file(image_path)
+
+            # Clear frame cache when loading new content
+            self._clear_frame_cache()
+
+            if self.is_video:
+                # Get video metadata
+                try:
+                    self.video_metadata = get_video_metadata(image_path)
+                    self.current_frame = 0
+
+                    # Extract first frame
+                    self.original_image = extract_frame_from_video(
+                        image_path,
+                        frame_number=self.current_frame
+                    )
+                    self.original_size = self.original_image.size
+                    self._log_debug("Loaded video %s, frame %d/%d (%s)", 
+                                  image_path, self.current_frame + 1, 
+                                  self.video_metadata.get('total_frames', 0),
+                                  self.original_size)
+
+                    # Setup video-specific UI controls
+                    self._setup_video_controls()
+                    self._generate_thumbnails()
+                except ImportError as e:
+                    error_msg = f"Video support requires imageio: {e}"
+                    self._log_debug("Video support not available: %s", e)
+                    if hasattr(self, 'status_var'):
+                        self._set_status(error_msg, error=True)
+                    raise
+            else:
+                # Regular image file
+                self.original_image = Image.open(image_path)
+                self.original_size = self.original_image.size
+                self._log_debug("Loaded image %s (%s)", image_path, self.original_size)
+
+                # Hide video controls if they exist
+                if self.video_controls_frame is not None:
+                    self.video_controls_frame.pack_forget()
 
             # Update zoom constraints now that we have an image
             self.max_zoom = self.calculate_max_zoom()
@@ -326,7 +401,30 @@ class SimpleImageViewer:
     def _run_generation(self, api_key, prompt):
         self._log_debug("Gemini generation started on worker thread.")
         try:
-            image_bytes = generate_image_edit(api_key, prompt, self.image_path)
+            # For videos, save current frame to temp file
+            image_path_to_use = self.image_path
+            temp_frame_file = None
+            
+            if self.is_video and self.original_image is not None:
+                # Save current frame to temp file
+                temp_frame_file = tempfile.NamedTemporaryFile(
+                    delete=False,
+                    suffix=".png",
+                    prefix="imageviewer_video_frame_",
+                )
+                self.original_image.save(temp_frame_file.name)
+                image_path_to_use = temp_frame_file.name
+                self._log_debug("Saved video frame to temp file: %s", temp_frame_file.name)
+            
+            image_bytes = generate_image_edit(api_key, prompt, image_path_to_use)
+            
+            # Clean up temp file if created
+            if temp_frame_file is not None and os.path.exists(temp_frame_file.name):
+                try:
+                    os.unlink(temp_frame_file.name)
+                    self._log_debug("Cleaned up temp frame file")
+                except Exception as e:
+                    self._log_debug("Failed to clean up temp frame file: %s", e)
         except (ValueError, GeminiServiceError, OSError) as exc:
             self._log_debug("Gemini generation failed: %s", exc)
             error_msg = str(exc)
@@ -387,7 +485,401 @@ class SimpleImageViewer:
         if hasattr(self, "status_label"):
             self.status_label.config(fg=color)
         self._log_debug("Status update -> %s", message)
-    
+
+    def _setup_video_controls(self):
+        """Create video control UI (slider, input, thumbnails)."""
+        # Get debug frame (parent of zoom_label)
+        debug_frame = self.zoom_label.master
+
+        # Remove existing video controls if they exist
+        if self.video_controls_frame is not None:
+            self.video_controls_frame.destroy()
+
+        # Create video controls frame (between debug info and metadata)
+        # Pack it after zoom_label but before metadata_frame (which is at bottom)
+        self.video_controls_frame = tk.Frame(debug_frame, bg='gray15', padx=0, pady=10)
+        # Pack before metadata_frame if it exists, otherwise just pack normally
+        if hasattr(self, 'metadata_text') and self.metadata_text.master:
+            metadata_frame = self.metadata_text.master
+            self.video_controls_frame.pack(fill=tk.X, pady=(10, 0), before=metadata_frame)
+        else:
+            # Fallback: just pack it
+            self.video_controls_frame.pack(fill=tk.X, pady=(10, 0))
+
+        total_frames = self.video_metadata.get('total_frames', 0)
+
+        # Frame label
+        frame_label = tk.Label(
+            self.video_controls_frame,
+            text=f"Frame: {self.current_frame + 1} / {total_frames}",
+            bg='gray15',
+            fg='white'
+        )
+        frame_label.pack(anchor=tk.W, pady=(0, 5))
+
+        # Frame slider
+        self.frame_slider = tk.Scale(
+            self.video_controls_frame,
+            from_=0,
+            to=max(0, total_frames - 1),
+            orient=tk.HORIZONTAL,
+            command=self._on_frame_slider_change,
+            bg='gray15',
+            fg='white',
+            highlightbackground='gray15',
+            troughcolor='gray25',
+            activebackground='gray40',
+        )
+        self.frame_slider.set(self.current_frame)
+        self.frame_slider.pack(fill=tk.X, pady=(0, 5))
+
+        # Frame input frame
+        frame_input_frame = tk.Frame(self.video_controls_frame, bg='gray15')
+        frame_input_frame.pack(fill=tk.X, pady=(0, 10))
+
+        tk.Label(
+            frame_input_frame,
+            text="Frame #:",
+            bg='gray15',
+            fg='white'
+        ).pack(side=tk.LEFT, padx=(0, 5))
+
+        self.frame_entry = tk.Entry(
+            frame_input_frame,
+            width=8,
+            bg='gray5',
+            fg='white',
+            insertbackground='white',
+            relief=tk.FLAT,
+        )
+        self.frame_entry.insert(0, str(self.current_frame))
+        self.frame_entry.pack(side=tk.LEFT)
+        self.frame_entry.bind('<Return>', self._on_frame_entry_change)
+        self.frame_entry.bind('<FocusOut>', self._on_frame_entry_change)
+
+        # Export button
+        export_button = tk.Button(
+            self.video_controls_frame,
+            text="Export Frame",
+            command=self._export_current_frame,
+            bg='gray30',
+            fg='white',
+            relief=tk.FLAT,
+        )
+        export_button.pack(fill=tk.X, pady=(5, 0))
+
+        # Thumbnails section
+        tk.Label(
+            self.video_controls_frame,
+            text="Thumbnails:",
+            bg='gray15',
+            fg='white'
+        ).pack(anchor=tk.W, pady=(0, 5))
+
+        # Scrollable canvas for thumbnails
+        thumbnails_canvas_frame = tk.Frame(self.video_controls_frame, bg='gray15')
+        thumbnails_canvas_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.thumbnails_canvas = tk.Canvas(
+            thumbnails_canvas_frame,
+            bg='gray10',
+            height=200,
+            highlightthickness=0,
+        )
+        thumbnails_scrollbar = tk.Scrollbar(
+            thumbnails_canvas_frame,
+            orient=tk.VERTICAL,
+            command=self.thumbnails_canvas.yview,
+            bg='gray15',
+            troughcolor='gray25',
+        )
+        self.thumbnails_canvas.configure(yscrollcommand=thumbnails_scrollbar.set)
+
+        self.thumbnails_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        thumbnails_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Container for thumbnail grid
+        self.thumbnails_container = tk.Frame(self.thumbnails_canvas, bg='gray10')
+        self.thumbnails_canvas.create_window((0, 0), window=self.thumbnails_container, anchor=tk.NW)
+
+        # Mouse wheel scrolling for thumbnails
+        def on_mousewheel(event):
+            self.thumbnails_canvas.yview_scroll(
+                int(-1 * (event.delta / 120)),
+                "units"
+            )
+        self.thumbnails_canvas.bind("<MouseWheel>", on_mousewheel)
+
+        # Update canvas scroll region when thumbnails change
+        def update_scroll_region(event):
+            self.thumbnails_canvas.configure(scrollregion=self.thumbnails_canvas.bbox("all"))
+        self.thumbnails_container.bind("<Configure>", update_scroll_region)
+
+    def _change_frame(self):
+        """Change displayed frame to current_frame with caching."""
+        try:
+            # Check cache first
+            cached_frame = self._get_cached_frame(self.current_frame)
+            if cached_frame:
+                self.original_image = cached_frame
+                self.original_size = cached_frame.size
+            else:
+                # Extract new frame
+                new_image = extract_frame_from_video(
+                    self.image_path,
+                    frame_number=self.current_frame
+                )
+                # Cache it
+                self._cache_frame(self.current_frame, new_image)
+
+                self.original_image = new_image
+                self.original_size = new_image.size
+
+            # Update zoom constraints
+            self.max_zoom = self.calculate_max_zoom()
+
+            # Refresh UI
+            self.display_image()
+            self.update_metadata_panel()
+            self._update_thumbnail_selection()
+
+            # Update frame label
+            total_frames = self.video_metadata.get('total_frames', 0)
+            if self.video_controls_frame is not None:
+                for widget in self.video_controls_frame.winfo_children():
+                    if isinstance(widget, tk.Label) and widget.cget("text").startswith("Frame:"):
+                        widget.config(text=f"Frame: {self.current_frame + 1} / {total_frames}")
+                        break
+
+        except Exception as e:
+            self._log_debug("Failed to change frame: %s", e)
+            self._set_status(f"Error changing frame: {e}", error=True)
+
+    def _on_frame_slider_change(self, value):
+        """Handle slider movement with throttling."""
+        try:
+            frame_num = int(float(value))
+
+            # Update entry and frame label immediately for visual feedback
+            if self.frame_entry is not None:
+                self.frame_entry.delete(0, tk.END)
+                self.frame_entry.insert(0, str(frame_num))
+
+            # Update frame label immediately
+            total_frames = self.video_metadata.get('total_frames', 0)
+            if self.video_controls_frame is not None:
+                for widget in self.video_controls_frame.winfo_children():
+                    if isinstance(widget, tk.Label) and widget.cget("text").startswith("Frame:"):
+                        widget.config(text=f"Frame: {frame_num + 1} / {total_frames}")
+                        break
+
+            # Throttle actual frame extraction (max 10 updates per second)
+            current_time = time.time()
+            time_since_last = current_time - self.last_slider_update
+
+            if time_since_last < 0.1:  # 100ms throttle
+                # Schedule update if not already pending
+                if not self.slider_update_pending:
+                    self.slider_update_pending = True
+                    self.root.after(100, self._process_pending_slider_update)
+                return
+
+            # Update immediately if enough time has passed
+            self.last_slider_update = current_time
+            self._process_frame_change(frame_num)
+        except (ValueError, TypeError) as e:
+            self._log_debug("Invalid slider value: %s", e)
+
+    def _process_pending_slider_update(self):
+        """Process pending slider update after throttle delay."""
+        self.slider_update_pending = False
+        if self.frame_slider is not None:
+            frame_num = int(float(self.frame_slider.get()))
+            self._process_frame_change(frame_num)
+
+    def _process_frame_change(self, frame_num: int):
+        """Process frame change with caching."""
+        if frame_num == self.current_frame:
+            return
+
+        # Check cache first
+        cached_frame = self._get_cached_frame(frame_num)
+        if cached_frame:
+            self.current_frame = frame_num
+            self.original_image = cached_frame
+            self.original_size = cached_frame.size
+            self.max_zoom = self.calculate_max_zoom()
+            self.display_image()
+            return
+
+        # Extract new frame
+        self.current_frame = frame_num
+        self._change_frame()
+
+    def _on_frame_entry_change(self, event=None):
+        """Handle direct frame number input."""
+        try:
+            if self.frame_entry is None:
+                return
+            frame_num = int(self.frame_entry.get())
+            total_frames = self.video_metadata.get('total_frames', 0)
+
+            # Clamp to valid range
+            frame_num = max(0, min(frame_num, total_frames - 1))
+
+            if frame_num != self.current_frame:
+                self.current_frame = frame_num
+                if self.frame_slider is not None:
+                    self.frame_slider.set(frame_num)
+                self._change_frame()
+        except ValueError:
+            # Reset to current frame on invalid input
+            if self.frame_entry is not None:
+                self.frame_entry.delete(0, tk.END)
+                self.frame_entry.insert(0, str(self.current_frame))
+
+    def _generate_thumbnails(self):
+        """Generate and display thumbnail grid."""
+        if not self.is_video or self.thumbnails_container is None:
+            return
+
+        try:
+            total_frames = self.video_metadata.get('total_frames', 0)
+            if total_frames == 0:
+                return
+
+            # Clear existing thumbnails
+            for widget in self.thumbnails_container.winfo_children():
+                widget.destroy()
+
+            # Calculate evenly distributed frame indices (max 20 thumbnails)
+            num_thumbnails = min(20, total_frames)
+            if num_thumbnails == 0:
+                return
+
+            if num_thumbnails == 1:
+                frame_indices = [0]
+            else:
+                frame_indices = [
+                    int(i * (total_frames - 1) / (num_thumbnails - 1))
+                    for i in range(num_thumbnails)
+                ]
+
+            # Extract thumbnails
+            thumbnails = extract_multiple_frames(
+                self.image_path,
+                frame_indices,
+                max_thumbnail_size=120
+            )
+
+            # Display in 2-column grid
+            cols = 2
+            for idx, (frame_num, thumbnail) in enumerate(zip(frame_indices, thumbnails)):
+                row = idx // cols
+                col = idx % cols
+
+                # Create thumbnail frame
+                thumb_frame = tk.Frame(
+                    self.thumbnails_container,
+                    bg='gray10',
+                    relief=tk.RAISED,
+                    borderwidth=1
+                )
+                thumb_frame.grid(row=row, column=col, padx=2, pady=2)
+
+                # Convert to PhotoImage
+                photo = ImageTk.PhotoImage(thumbnail)
+                thumb_label = tk.Label(
+                    thumb_frame,
+                    image=photo,
+                    cursor='hand2',
+                    bg='gray10'
+                )
+                thumb_label.image = photo  # Keep reference
+                thumb_label.pack()
+
+                # Bind click event
+                thumb_label.bind(
+                    '<Button-1>',
+                    lambda e, fn=frame_num: self._on_thumbnail_click(fn)
+                )
+
+            # Update canvas scroll region
+            self.thumbnails_container.update_idletasks()
+            self.thumbnails_canvas.configure(
+                scrollregion=self.thumbnails_canvas.bbox("all")
+            )
+
+        except Exception as e:
+            self._log_debug("Failed to generate thumbnails: %s", e)
+            self._set_status(f"Error generating thumbnails: {e}", error=True)
+
+    def _on_thumbnail_click(self, frame_number):
+        """Jump to frame when thumbnail is clicked."""
+        try:
+            if frame_number != self.current_frame:
+                self.current_frame = frame_number
+                if self.frame_slider is not None:
+                    self.frame_slider.set(frame_number)
+                if self.frame_entry is not None:
+                    self.frame_entry.delete(0, tk.END)
+                    self.frame_entry.insert(0, str(frame_number))
+                self._change_frame()
+        except Exception as e:
+            self._log_debug("Failed to jump to frame: %s", e)
+            self._set_status(f"Error jumping to frame: {e}", error=True)
+
+    def _update_thumbnail_selection(self):
+        """Highlight current frame thumbnail."""
+        # This can be enhanced to visually highlight the current frame
+        # For now, we'll just ensure the thumbnail is visible
+        pass
+
+    def _cache_frame(self, frame_number: int, image):
+        """Cache a frame for quick access."""
+        # Limit cache size using LRU-like behavior
+        if len(self.frame_cache) >= self.max_cache_size:
+            # Remove oldest entry (simple FIFO)
+            oldest_key = next(iter(self.frame_cache))
+            del self.frame_cache[oldest_key]
+
+        self.frame_cache[frame_number] = image.copy()
+
+    def _get_cached_frame(self, frame_number: int):
+        """Get cached frame if available."""
+        return self.frame_cache.get(frame_number)
+
+    def _clear_frame_cache(self):
+        """Clear all cached frames."""
+        self.frame_cache.clear()
+
+    def _export_current_frame(self):
+        """Export current frame to file."""
+        if not self.is_video or self.original_image is None:
+            return
+
+        # Suggest filename based on video name and frame number
+        video_name = os.path.splitext(os.path.basename(self.image_path))[0]
+        default_filename = f"{video_name}_frame_{self.current_frame:06d}.png"
+
+        file_path = filedialog.asksaveasfilename(
+            title="Export Frame As",
+            defaultextension=".png",
+            filetypes=[
+                ("PNG files", "*.png"),
+                ("JPEG files", "*.jpg"),
+                ("All files", "*.*"),
+            ],
+            initialfile=default_filename,
+        )
+
+        if file_path:
+            try:
+                self.original_image.save(file_path)
+                self._set_status(f"Frame exported to: {os.path.basename(file_path)}", error=False)
+            except Exception as e:
+                self._set_status(f"Failed to export frame: {e}", error=True)
+
     def calculate_max_zoom(self):
         """Calculate max zoom to not exceed 4K resolution"""
         return calc_max_zoom(self.original_size)
