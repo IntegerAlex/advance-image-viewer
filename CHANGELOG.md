@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-01-29
+
+### Added
+- **Video Format Support**: Comprehensive video file support for 10+ formats
+  - WebM (VP8/VP9), MP4 (H.264/H.265), AVI, MOV, MKV, FLV, WMV, M4V, 3GP, OGV
+  - Automatic video detection and frame extraction
+  - RFC 6386 compliant WebP image format support
+- **Frame Navigation System**: Interactive video frame navigation
+  - Frame slider with smooth throttled updates (10 updates/second max)
+  - Direct frame number input with validation
+  - Real-time frame counter display
+- **Frame Export Functionality**: Export individual video frames as images
+  - Export current frame with intelligent filename generation
+  - Support for PNG, JPEG, and other image formats
+  - File dialog with format selection
+- **Video Metadata Display**: Comprehensive video information panel
+  - Total frames, FPS, duration (HH:MM:SS format)
+  - Video codec information
+  - Resolution and file size details
+- **Thumbnail Preview Grid**: Visual frame navigation
+  - 20 evenly-distributed thumbnails in 2-column grid
+  - Clickable thumbnails for instant frame navigation
+  - Scrollable canvas with mouse wheel support
+  - High-quality LANCZOS resampling for thumbnails
+- **Performance Optimizations**: Enhanced video playback performance
+  - Frame caching system (10 frame LRU cache)
+  - Throttled slider updates to prevent excessive frame extractions
+  - Immediate UI feedback during frame navigation
+  - Efficient frame extraction with proper resource cleanup
+- **Gemini AI Integration**: Video frame processing with AI
+  - Automatic frame extraction for AI processing
+  - Temporary file management for video frames
+  - Seamless integration with existing AI workflow
+
+### Changed
+- **File Dialog**: Enhanced to support video formats and WebP images
+  - Added video file type filters
+  - Added WebP image format support
+  - Improved file type categorization
+- **Image Loading**: Unified image/video loading pipeline
+  - Automatic format detection
+  - Video controls appear dynamically when video is loaded
+  - Graceful fallback for unsupported formats
+
+### Fixed
+- **LegacyReader Compatibility**: Fixed frame count detection for legacy imageio readers
+  - Added fallback to metadata-based frame count calculation
+  - Improved error handling for various video codecs
+  - Better compatibility with different imageio backends
+
+### Technical Improvements
+- Added `src/video_utils.py` module for video processing utilities
+- Implemented frame caching with FIFO eviction policy
+- Enhanced error handling for video file operations
+- Improved resource management with proper reader cleanup
+- Added comprehensive video metadata extraction
+
 ## [0.2.1] - 2025-11-21
 
 ### Added
